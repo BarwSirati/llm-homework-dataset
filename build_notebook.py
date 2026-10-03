@@ -9,14 +9,29 @@ from pathlib import Path
 
 OUT = Path(__file__).parent / "pdf_table_to_json_demo.ipynb"
 
+# Fill these in -- they populate the header block the course template requires.
+STUDENT = {
+    "{FULL_NAME}": "Write Your Full Name",
+    "{STUDENT_ID}": "Your Student ID",
+    "{DEPARTMENT}": "Computer Engineering",
+}
+
+# Raw GitHub base the notebook downloads the sample PDFs from.
+REPO_RAW_BASE = (
+    "https://raw.githubusercontent.com/BarwSirati/llm-homework-dataset/main/data"
+)
+
 cells = []
 
 
 def md(text):
+    text = text.strip("\n")
+    for placeholder, value in STUDENT.items():
+        text = text.replace(placeholder, value)
     cells.append({
         "cell_type": "markdown",
         "metadata": {},
-        "source": text.strip("\n").splitlines(keepends=True),
+        "source": text.splitlines(keepends=True),
     })
 
 
@@ -31,9 +46,34 @@ def code(text):
 
 
 # ==========================================================================
+# Header block required by the course template (LLM-Homework-Template.ipynb).
 md(r"""
-# Demo: การแปลงตารางซับซ้อนจาก PDF เป็น JSON
 # Demo: Converting Complex PDF Tables into JSON
+
+**Full Name**: {FULL_NAME}
+
+**Student ID**: {STUDENT_ID}
+
+**Department**: {DEPARTMENT}
+
+**Updated Date**: 2026-10-03
+
+---
+
+**Subject**: Large Language Model
+
+**Submit To**: Rathachai Chawuthai (CE-KMITL)
+
+---
+
+![CC BY-NC-SA](https://i.creativecommons.org/l/by-nc-sa/4.0/88x31.png)
+
+This work is licensed under a
+[Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License](http://creativecommons.org/licenses/by-nc-sa/4.0/).
+""")
+
+md(r"""
+# ภาพรวมของงาน / Task Overview
 
 **TH —** โน้ตบุ๊กนี้สาธิตการดึงข้อมูลตารางจากไฟล์ PDF (ที่สร้างจาก Microsoft Word)
 ให้ออกมาเป็น JSON ที่มีโครงสร้าง โดยใช้ **โมเดลภาษาเชิงภาพ (Vision-Language Model) แบบ local เท่านั้น**
@@ -123,18 +163,17 @@ md(r"""
 ## 3. ดาวน์โหลดไฟล์ PDF ตัวอย่าง / Download the Sample PDFs
 
 **TH —** ไฟล์ PDF ทั้ง 3 ไฟล์ถูกสร้างจาก Microsoft Word แล้วอัปโหลดไว้บน GitHub
-(โจทย์อนุญาตให้ดึง input จาก GitHub ได้) — แก้ตัวแปร `REPO_RAW_BASE` ให้ชี้ไปยัง repo ของคุณ
+ซึ่งโจทย์อนุญาตให้ดึง input data files จาก GitHub ได้ (ไม่ถือเป็นการเรียก 3rd-party service)
 
-**EN —** The three PDFs were produced from Microsoft Word and published on GitHub
-(the assignment permits pulling input files from GitHub). Edit `REPO_RAW_BASE` to point
-at your own repository.
+**EN —** The three PDFs were produced from Microsoft Word and published on GitHub, which
+the assignment explicitly permits for input data files.
 """)
 
-code(r'''
+code('''
 import os, urllib.request
 
-# EDIT THIS to your own repo (raw.githubusercontent.com/<user>/<repo>/<branch>/data)
-REPO_RAW_BASE = "https://raw.githubusercontent.com/USERNAME/REPO/main/data"
+# Sample PDFs live in the repo below; they were exported from Microsoft Word.
+REPO_RAW_BASE = "''' + REPO_RAW_BASE + '''"
 
 PDF_FILES = {
     "simple":       "table_simple.pdf",
