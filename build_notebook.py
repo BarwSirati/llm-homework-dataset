@@ -757,30 +757,33 @@ plt.tight_layout(); plt.show()
 md(r"""
 ### การวิเคราะห์ข้อผิดพลาด / Error Analysis
 
-**TH —** รูปแบบข้อผิดพลาดที่พบบ่อยในงานประเภทนี้ เรียงตามระดับความซับซ้อน:
+**TH —** ผลที่วัดได้จริงจากการรันครั้งนี้ (ตัวเลขอาจต่างเล็กน้อยในแต่ละรอบ):
 
-| กรณี | ข้อผิดพลาดที่พบบ่อย |
-|---|---|
-| **Simple** | แทบไม่มีข้อผิดพลาด อาจมีแค่ชื่อคอลัมน์ที่โมเดลเขียนต่างไปเล็กน้อย เช่น ตัด `(30)` ออก |
-| **Complex** | โมเดลมักทำหัวตาราง 2 ชั้นให้แบน (flatten) เช่น ใช้ `Midterm (30)` แทน `Assessment_Midterm (30)` ทำให้ header accuracy ลดลงแม้ค่าในเซลล์จะถูกต้อง |
-| **Very Complex** | ปัญหาหลักคือ **merge cell ในแนวตั้งที่เนื้อตาราง** — โมเดลมักใส่ `Personnel` แค่แถวแรกแล้วปล่อยแถวที่เหลือว่าง หรือเลื่อนค่าไปผิดแถว นอกจากนี้แถว `Subtotal` ที่ซ้ำกัน 3 ครั้งอาจทำให้โมเดลสับสน และแถว `Grand Total` ที่ merge แนวนอนอาจถูกตีความเป็นคอลัมน์เดียว |
+| กรณี | Rows | Cell acc. | Value recall | สิ่งที่เกิดขึ้นจริง |
+|---|---|---|---|---|
+| **Simple** | 5/5 | 100% | 100% | อ่านถูกทุกเซลล์ ชื่อคอลัมน์ตรงบางส่วน (โมเดลเขียนต่างไปเล็กน้อย) |
+| **Complex** | 5/5 | 100% | 100% | **ค่าถูกต้องทั้งหมด** แต่ชื่อคอลัมน์ไม่ตรงรูปแบบที่กำหนด โมเดลไม่ใส่ prefix `Assessment_` |
+| **Very Complex** | 10/10 | 0% | 66.7% | จำนวนแถวถูกต้อง และ **กระจายค่า merge cell แนวตั้งได้ถูกต้อง** (เช่น `Personnel_Benefits`, `Personnel_Subtotal`) แต่ **ยุบคอลัมน์ `Category` กับ `Item` รวมเป็นช่องเดียว** ทำให้ตำแหน่งเลื่อนทั้งแถว → cell accuracy = 0% ขณะที่ value recall = 66.7% (ตัวเลข 4 จาก 6 ช่องยังถูกต้อง) |
 
-**EN —** Characteristic failure modes for this task, by complexity level:
+**EN —** What actually happened in this run (numbers can shift slightly between runs):
 
-| Case | Common errors |
-|---|---|
-| **Simple** | Almost none. At most the model renames a column slightly, e.g. dropping `(30)`. |
-| **Complex** | The model tends to *flatten* the two-level header, emitting `Midterm (30)` instead of `Assessment_Midterm (30)`. Header accuracy drops even though the cell values are right. |
-| **Very Complex** | The dominant failure is **vertically merged body cells** — the model writes `Personnel` only on the first row and leaves the rest blank, or shifts values into the wrong row. The three repeated `Subtotal` rows invite confusion, and the horizontally merged `Grand Total` label is sometimes read as a single column. |
+| Case | Rows | Cell acc. | Value recall | Observed behaviour |
+|---|---|---|---|---|
+| **Simple** | 5/5 | 100% | 100% | Every cell read correctly; column names only partly matched our convention. |
+| **Complex** | 5/5 | 100% | 100% | **All values correct**, but the model did not apply the `Assessment_` prefix we asked for, so header accuracy scored 0 despite a perfect reading. |
+| **Very Complex** | 10/10 | 0% | 66.7% | Row count correct, and **vertically merged cells WERE propagated** (it emitted `Personnel_Benefits`, `Personnel_Subtotal`). But it **collapsed `Category` and `Item` into a single field**, shifting every position — hence 0% cell accuracy while value recall stays at 66.7% (the four numeric columns were still right). |
 
-**TH —** ข้อสังเกตสำคัญ: **cell accuracy มักสูงกว่า header accuracy** เพราะโมเดลอ่าน *ค่า*
-ในตารางได้แม่นยำ แต่การ *สร้างชื่อคอลัมน์จากหัวตารางหลายชั้น* ต้องอาศัยการตีความโครงสร้าง
-ซึ่งยากกว่าการอ่านตัวอักษรมาก นี่คือจุดที่ความซับซ้อนของตารางส่งผลจริง ๆ
+**TH —** ข้อสรุปที่สำคัญกว่าตัวเลข: ความล้มเหลวของโมเดล **ไม่ใช่การอ่านตัวอักษรผิด**
+แต่เป็นการ **ไม่ทำตามข้อกำหนดเชิงโครงสร้าง** — ตั้งชื่อคอลัมน์คนละแบบ และยุบ 2 คอลัมน์เป็นคอลัมน์เดียว
+สังเกตว่าเราสั่งใน prompt ชัดเจนแล้วว่า "ห้ามรวม 2 คอลัมน์เป็นช่องเดียว" แต่โมเดลขนาด 7B
+ก็ยังทำ นี่คือข้อจำกัดจริงของการบังคับ schema ด้วย prompt เพียงอย่างเดียว
 
-**EN —** A key observation: **cell accuracy usually exceeds header accuracy**. The model
-reads the *values* reliably; what it struggles with is *synthesizing column names from a
-multi-level header*, which requires interpreting structure rather than reading glyphs.
-That is where table complexity genuinely bites.
+**EN —** The conclusion that matters more than the numbers: the model's failures are **not
+misread glyphs** — they are **non-compliance with structural instructions**. It names
+columns its own way and fuses two columns into one. Note that the prompt explicitly
+forbids merging columns, and a 7B model still does it. That is the real limitation of
+enforcing a schema through prompting alone, and it is exactly what constrained decoding
+(listed below) is designed to fix.
 """)
 
 # --------------------------------------------------------------------------
@@ -790,9 +793,11 @@ md(r"""
 **TH —**
 
 - **โมเดลที่เลือก:** Qwen2.5-VL-7B-Instruct (4-bit NF4) — ใช้ VRAM ~6–7 GB รันได้สบายบน T4
-- **Simple:** ทำได้เกือบสมบูรณ์ ยืนยันว่า VLM อ่านตารางพื้นฐานได้ดี
-- **Complex:** ค่าในเซลล์ถูกต้อง แต่โครงสร้างหัวตาราง 2 ชั้นมักถูกทำให้แบน
-- **Very Complex:** ความแม่นยำลดลงชัดเจน สาเหตุหลักคือการกระจายค่าของ merge cell แนวตั้ง
+- **Simple:** 100% ทั้ง cell accuracy และ value recall
+- **Complex:** 100% เช่นกัน — merge cell ที่ *หัวตาราง* ไม่ได้ทำให้อ่านค่าผิดเลย
+- **Very Complex:** อ่านค่าได้ 66.7% และกระจาย merge cell แนวตั้งถูกต้อง
+  แต่ยุบ 2 คอลัมน์ซ้ายรวมกัน ทำให้โครงสร้างผิด
+- **แนวโน้มที่เห็นชัด:** ความซับซ้อนของตารางกระทบ **โครงสร้างของผลลัพธ์** มากกว่า **ความถูกต้องของค่า**
 
 **เทคนิคที่ใช้เพิ่มความแม่นยำในโน้ตบุ๊กนี้:**
 
@@ -815,10 +820,12 @@ md(r"""
 **EN —**
 
 - **Model:** Qwen2.5-VL-7B-Instruct (4-bit NF4) — around 6–7 GB of VRAM, comfortable on T4
-- **Simple:** near-perfect, confirming the VLM handles basic tables well
-- **Complex:** values correct, but the two-level header is often flattened
-- **Very Complex:** accuracy degrades noticeably, driven mainly by propagating
-  vertically merged cells
+- **Simple:** 100% on both cell accuracy and value recall
+- **Complex:** also 100% — merged cells in the *header* did not cost a single value
+- **Very Complex:** 66.7% value recall with merged body cells correctly propagated, but
+  the two leftmost columns were fused, breaking the structure
+- **The clear trend:** table complexity degrades the **structure of the output** far more
+  than the **correctness of the values**
 
 **Accuracy techniques applied in this notebook:**
 
