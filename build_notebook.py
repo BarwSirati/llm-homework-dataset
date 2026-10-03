@@ -395,10 +395,13 @@ Extract the table in this image into JSON with exactly this shape:
 {"headers": [...], "rows": [{...}, ...]}
 
 Rules:
-1. "headers" is a flat list of the final (leaf) column names, left to right.
-2. For multi-level headers, join ancestor and child with an underscore, e.g. a
-   "Quarter 1" group containing "Plan" becomes "Quarter 1_Plan". A column whose
-   header cell spans every header row keeps its own name unchanged.
+1. Count the table's data columns by its vertical grid lines. "headers" must have
+   exactly that many entries, left to right, and every row object must have exactly
+   that many fields. NEVER combine two columns into one field.
+2. Name each column using AT MOST THE TWO INNERMOST header rows that apply to it,
+   joined by an underscore: a "Quarter 1" group over a "Plan" column becomes
+   "Quarter 1_Plan". Ignore any outer header row that merely captions the whole
+   table or states units. If only one header row applies, use that name alone.
 3. Each entry in "rows" is an object keyed by those exact header names, in the
    same left-to-right order.
 4. If a cell is merged across several rows, REPEAT its value on every row it
@@ -409,11 +412,13 @@ Rules:
    reformat, or correct any value.
 7. Output ONLY the JSON object. No explanation, no markdown fences.
 
-Worked example for an unrelated table whose header is
-"Region" | "2023" spanning "Q1","Q2" , with "North" merged down two rows:
-{"headers": ["Region", "2023_Q1", "2023_Q2"],
- "rows": [{"Region": "North", "2023_Q1": "10", "2023_Q2": "12"},
-          {"Region": "North", "2023_Q1": "14", "2023_Q2": "9"}]}"""
+Worked example for an unrelated 3-column table. Its top row is the caption
+"Annual Report 2023 (unit: tons)"; below it "Region" stands alone while "H1"
+spans "Jan" and "Feb"; the body has "North" merged down two rows.
+The caption is ignored and "North" is repeated:
+{"headers": ["Region", "H1_Jan", "H1_Feb"],
+ "rows": [{"Region": "North", "H1_Jan": "10", "H1_Feb": "12"},
+          {"Region": "North", "H1_Jan": "14", "H1_Feb": "9"}]}"""
 
 print(EXTRACTION_PROMPT)
 ''')
@@ -545,23 +550,26 @@ md(r"""
 
 1. **Header accuracy** — ชื่อคอลัมน์ที่ดึงได้ตรงกับที่ควรเป็นกี่ % (ใช้ set comparison)
 2. **Row count** — จำนวนแถวถูกต้องหรือไม่
-3. **Cell accuracy** — เทียบค่าในเซลล์ทีละตัว **โดยเทียบตามตำแหน่งคอลัมน์** ไม่ใช่ตามชื่อ
+3. **Cell accuracy** — เทียบค่าในเซลล์ทีละตัว **ตามตำแหน่งคอลัมน์** (เข้มงวดที่สุด)
+4. **Value recall** — ค่าที่ถูกต้องไปอยู่ใน *แถว* ที่ถูกต้องหรือไม่ โดย**ไม่สนชื่อและตำแหน่งคอลัมน์**
 
-> จุดสำคัญ: ถ้าเทียบเซลล์ด้วย *ชื่อ* คอลัมน์ เมื่อโมเดลทำหัวตารางแบน cell accuracy
-> จะกลายเป็น 0 ไปด้วย ทำให้แยกไม่ออกว่าโมเดล "อ่านค่าผิด" หรือแค่ "ตั้งชื่อคอลัมน์ต่างไป"
-> การเทียบตามตำแหน่งทำให้ 2 ตัวชี้วัดนี้เป็นอิสระต่อกัน
+> ทำไมต้องมี 3 ตัว: ถ้ามีแต่ cell accuracy เราจะแยกไม่ออกว่าโมเดล "อ่านตัวเลขผิด"
+> หรือแค่ "จัดคอลัมน์ต่างไป" เช่น ถ้าโมเดลรวม 2 คอลัมน์เป็นช่องเดียว ตำแหน่งจะเลื่อนหมด
+> ทำให้ cell accuracy = 0% ทั้งที่อ่านตัวเลขถูกทุกตัว — **value recall จะจับกรณีนี้ได้**
 
 **EN —** We compare the output against a **ground truth** written in advance from the
 actual table content, measuring three dimensions:
 
 1. **Header accuracy** — what fraction of expected column names were recovered
 2. **Row count** — was the number of rows correct
-3. **Cell accuracy** — value-by-value comparison **matched by column position**, not by name
+3. **Cell accuracy** — value-by-value comparison **matched by column position** (strictest)
+4. **Value recall** — did the right values reach the right *row* at all, **ignoring both
+   column names and column positions**
 
-> Why position: if cells were matched by column *name*, a flattened header would drag
-> cell accuracy to zero too, and we could not distinguish "the model misread the values"
-> from "the model named the columns differently". Matching positionally keeps the two
-> metrics independent.
+> Why three metrics: cell accuracy alone cannot tell "the model misread the digits" from
+> "the model organised the columns differently". If the model merges two columns into one
+> field, every position shifts and cell accuracy collapses to 0% even when every value was
+> read correctly — **value recall is what exposes that case**.
 """)
 
 code(r'''
@@ -669,7 +677,7 @@ def score(predicted, truth):
     """
     if predicted is None:
         return {"headers": 0.0, "rows_found": 0,
-                "rows_expected": len(truth["rows"]), "cells": 0.0}
+                "rows_expected": len(truth["rows"]), "cells": 0.0, "values": 0.0}
 
     gt_headers = [norm(h) for h in truth["headers"]]
     pred_headers = [norm(h) for h in predicted.get("headers", [])]
@@ -677,6 +685,7 @@ def score(predicted, truth):
 
     pred_rows = predicted.get("rows", [])
     hits = total = 0
+    recalled = 0
     for i, gt_row in enumerate(truth["rows"]):
         gt_values = [norm(v) for v in gt_row.values()]
         # Row objects preserve the model's column order, so compare positionally.
@@ -687,11 +696,21 @@ def score(predicted, truth):
             if j < len(pred_values) and pred_values[j] == want:
                 hits += 1
 
+        # Value recall ignores naming AND position: did the right values land in
+        # the right row at all? This separates "misread the text" from "organised
+        # the columns differently", which the positional score cannot distinguish.
+        pool = list(pred_values)
+        for want in gt_values:
+            if want in pool:
+                pool.remove(want)
+                recalled += 1
+
     return {
         "headers": header_acc,
         "rows_found": len(pred_rows),
         "rows_expected": len(truth["rows"]),
         "cells": hits / total if total else 0.0,
+        "values": recalled / total if total else 0.0,
     }
 
 
@@ -703,9 +722,10 @@ results = {
 
 import pandas as pd
 df = pd.DataFrame(results).T
-df["headers"] = (df["headers"] * 100).round(1).astype(str) + "%"
-df["cells"]   = (df["cells"]   * 100).round(1).astype(str) + "%"
-df.columns = ["Header accuracy", "Rows found", "Rows expected", "Cell accuracy"]
+for col in ("headers", "cells", "values"):
+    df[col] = (df[col] * 100).round(1).astype(str) + "%"
+df.columns = ["Header accuracy", "Rows found", "Rows expected",
+              "Cell accuracy", "Value recall"]
 print(df.to_string())
 ''')
 
@@ -717,13 +737,15 @@ md(r"""
 
 code(r'''
 labels = list(results.keys())
-header_scores = [results[k]["headers"] * 100 for k in labels]
-cell_scores   = [results[k]["cells"]   * 100 for k in labels]
+series = [("Header accuracy", "headers"),
+          ("Cell accuracy", "cells"),
+          ("Value recall", "values")]
 
 x = range(len(labels))
-fig, ax = plt.subplots(figsize=(8, 4.5))
-ax.bar([i - 0.2 for i in x], header_scores, width=0.4, label="Header accuracy")
-ax.bar([i + 0.2 for i in x], cell_scores,   width=0.4, label="Cell accuracy")
+fig, ax = plt.subplots(figsize=(9, 4.5))
+for offset, (title, key) in zip((-0.27, 0.0, 0.27), series):
+    ax.bar([i + offset for i in x], [results[k][key] * 100 for k in labels],
+           width=0.26, label=title)
 ax.set_xticks(list(x)); ax.set_xticklabels(labels)
 ax.set_ylim(0, 105); ax.set_ylabel("Accuracy (%)")
 ax.set_title("Extraction accuracy vs. table complexity")
