@@ -148,12 +148,12 @@ code(r'''
 ''')
 
 code(r'''
-import torch, transformers, bitsandbytes, fitz, PIL
+import torch, transformers, bitsandbytes, pymupdf, PIL
 
 print(f"torch         {torch.__version__}")
 print(f"transformers  {transformers.__version__}")
 print(f"bitsandbytes  {bitsandbytes.__version__}")
-print(f"pymupdf       {getattr(fitz, '__version__', fitz.VersionBind)}")
+print(f"pymupdf       {pymupdf.__version__}")
 print(f"pillow        {PIL.__version__}")
 print(f"CUDA device   {torch.cuda.get_device_name(0)}")
 ''')
@@ -210,27 +210,56 @@ code(r'''
 md(r"""
 ## 4. แปลง PDF เป็นรูปภาพ / Render PDF Pages to Images
 
-**TH —** โมเดล VLM รับ input เป็นรูปภาพ เราจึง render หน้า PDF ด้วย PyMuPDF ที่ความละเอียด
-200 DPI ซึ่งคมพอให้อ่านตัวเลขในตารางได้ แต่ยังไม่ใหญ่จนเปลือง VRAM
+**TH —** โมเดล VLM รับ input เป็นรูปภาพ ขั้นตอนนี้มีผลต่อความแม่นยำ **มากที่สุด**
+เราทำ 2 อย่างเพื่อเพิ่มความแม่นยำ:
 
-**EN —** A VLM consumes images, so we render each PDF page with PyMuPDF at 200 DPI —
-sharp enough to read the table figures, yet small enough to keep the visual token
-count (and VRAM) under control.
+1. **Render ที่ 300 DPI** (แทน 200) — ตัวเลขในตารางคมขึ้น ลดการอ่านผิด เช่น `1,180` vs `1,100`
+2. **Auto-crop ขอบขาวทิ้ง** — หน้า A4 มีตารางอยู่แค่ด้านบนราว 25% ที่เหลือเป็นกระดาษเปล่า
+   ถ้าส่งทั้งหน้าเข้าโมเดล **visual token กว่า 70% จะถูกใช้ไปกับพื้นที่ว่าง**
+   และตารางจะถูกย่อจนเล็กเกินอ่าน การ crop ทำให้ token ทั้งหมดตกอยู่ที่ตัวตารางจริง ๆ
+
+**EN —** A VLM consumes images, and this step affects accuracy **more than any other**.
+Two things matter here:
+
+1. **Render at 300 DPI** (up from 200) so digits stay sharp — this is what separates
+   `1,180` from `1,100` in the model's reading.
+2. **Auto-crop the whitespace.** The table occupies only the top ~25% of an A4 page.
+   Feeding the whole page spends **over 70% of the visual token budget on blank paper**,
+   and the resizing that follows shrinks the table below legibility. Cropping puts the
+   entire token budget on the table itself.
 """)
 
 code(r'''
-import fitz
-from PIL import Image
+try:
+    import pymupdf as fitz          # PyMuPDF >= 1.24 renamed the module
+except ImportError:
+    import fitz
+from PIL import Image, ImageOps
 
-def pdf_to_image(path, dpi=200):
-    """Render the first page of a PDF into a PIL image."""
+def pdf_to_image(path, dpi=300, pad=12):
+    """Render page 1 of a PDF and crop it tight to the inked region.
+
+    Cropping matters more than it looks: the table sits in the top quarter of an
+    otherwise blank A4 page, so without this the model spends most of its visual
+    tokens looking at white paper.
+    """
     page = fitz.open(path)[0]
     pix = page.get_pixmap(dpi=dpi)
-    return Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+    img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+    # getbbox() finds non-zero pixels, so invert first: white paper -> black.
+    bbox = ImageOps.invert(img.convert("L")).getbbox()
+    if bbox:
+        left, top, right, bottom = bbox
+        img = img.crop((max(left - pad, 0), max(top - pad, 0),
+                        min(right + pad, img.width),
+                        min(bottom + pad, img.height)))
+    return img
 
 images = {k: pdf_to_image(f"data/{v}") for k, v in PDF_FILES.items()}
 for key, img in images.items():
-    print(f"{key:13s} {img.size[0]} x {img.size[1]} px")
+    w, h = img.size
+    print(f"{key:13s} {w} x {h} px  ({w * h / 1e6:.2f} MP after crop)")
 ''')
 
 md(r"""
@@ -244,11 +273,10 @@ the header depth and the spread of merged cells increase from case to case.
 code(r'''
 import matplotlib.pyplot as plt
 
-fig, axes = plt.subplots(1, 3, figsize=(21, 9))
+fig, axes = plt.subplots(3, 1, figsize=(14, 13))
 for ax, (key, img) in zip(axes, images.items()):
-    # Crop to the top third -- the tables sit at the top of an otherwise blank page.
-    ax.imshow(img.crop((0, 0, img.width, img.height // 3)))
-    ax.set_title(key, fontsize=14, fontweight="bold")
+    ax.imshow(img)
+    ax.set_title(key, fontsize=13, fontweight="bold")
     ax.axis("off")
 plt.tight_layout()
 plt.show()
@@ -262,15 +290,17 @@ md(r"""
 ค่าสำคัญสำหรับ T4 คือ `bnb_4bit_compute_dtype=torch.float16` (ห้ามใช้ bfloat16)
 และ `attn_implementation="sdpa"` (ห้ามใช้ flash_attention_2)
 
-นอกจากนี้เรากำหนด `min_pixels` / `max_pixels` ที่ processor เพื่อจำกัดจำนวน visual token
-ไม่ให้ภาพหน้า PDF ที่สูงมากทำให้ VRAM ล้น
+นอกจากนี้เราตั้ง `max_pixels` ของ processor ไว้ค่อนข้างสูง (2560 patches) เพราะโมเดลที่ 4-bit
+เหลือ VRAM ว่างราว 8 GB ซึ่งคุ้มที่จะใช้ไปกับความละเอียดของภาพตาราง — นี่คือ trade-off
+ที่ให้ผลตอบแทนด้านความแม่นยำสูงที่สุดในงานนี้
 
 **EN —** Load Qwen2.5-VL-7B-Instruct in 4-bit NF4 with double quantization. The settings
 that matter on T4 are `bnb_4bit_compute_dtype=torch.float16` (bfloat16 is unsupported)
 and `attn_implementation="sdpa"` (FlashAttention-2 is unavailable on Turing).
 
-We also cap `min_pixels` / `max_pixels` on the processor so a tall PDF page cannot
-explode the visual token count and exhaust VRAM.
+We set the processor's `max_pixels` generously (2560 patches): with the model at 4-bit
+there is roughly 8 GB of VRAM free, and spending it on image resolution is the single
+highest-return trade-off available for this task.
 
 > ขั้นตอนนี้ใช้เวลาประมาณ 3–5 นาทีในการดาวน์โหลดน้ำหนักโมเดลครั้งแรก
 > This step takes roughly 3–5 minutes to download the weights on first run.
@@ -302,11 +332,13 @@ print("model loaded")
 ''')
 
 code(r'''
-# Cap the visual token budget: 256..1024 patches of 28x28 pixels.
+# Visual token budget, in patches of 28x28 px. 2560 is deliberately generous:
+# a cropped table at 300 DPI needs the resolution, and with the model at 4-bit
+# there is ~8 GB of T4 memory free to spend on it.
 processor = AutoProcessor.from_pretrained(
     MODEL_ID,
-    min_pixels=256 * 28 * 28,
-    max_pixels=1024 * 28 * 28,
+    min_pixels=512 * 28 * 28,
+    max_pixels=2560 * 28 * 28,
 )
 
 vram = torch.cuda.memory_allocated() / 1024**3
@@ -336,6 +368,8 @@ We use `do_sample=False` (greedy decoding) so results are reproducible.
 """)
 
 code(r'''
+# The worked example uses an UNRELATED table, so it teaches the output format
+# without leaking any answer for the three tables we actually evaluate on.
 EXTRACTION_PROMPT = """You are a precise table extraction engine.
 
 Extract the table in this image into JSON with exactly this shape:
@@ -343,14 +377,25 @@ Extract the table in this image into JSON with exactly this shape:
 
 Rules:
 1. "headers" is a flat list of the final (leaf) column names, left to right.
-2. For multi-level headers, join the parent and child with an underscore,
-   e.g. a "Quarter 1" group containing "Plan" becomes "Quarter 1_Plan".
-   A header that spans all levels alone keeps its own name.
-3. Each entry in "rows" is an object keyed by those exact header names.
+2. For multi-level headers, join ancestor and child with an underscore, e.g. a
+   "Quarter 1" group containing "Plan" becomes "Quarter 1_Plan". A column whose
+   header cell spans every header row keeps its own name unchanged.
+3. Each entry in "rows" is an object keyed by those exact header names, in the
+   same left-to-right order.
 4. If a cell is merged across several rows, REPEAT its value on every row it
-   covers. Never leave a cell empty because of a merge.
-5. Copy the text exactly as printed, including commas in numbers.
-6. Output ONLY the JSON object. No explanation, no markdown fences."""
+   covers. Never leave a field empty or omit it because of a merge.
+5. If a label is merged horizontally across the leading columns (such as a
+   total row), repeat that label in each column it spans.
+6. Copy text exactly as printed, including commas in numbers. Do not compute,
+   reformat, or correct any value.
+7. Output ONLY the JSON object. No explanation, no markdown fences.
+
+Worked example for an unrelated table whose header is
+"Region" | "2023" spanning "Q1","Q2" , with "North" merged down two rows:
+{"headers": ["Region", "2023_Q1", "2023_Q2"],
+ "rows": [{"Region": "North", "2023_Q1": "10", "2023_Q2": "12"},
+          {"Region": "North", "2023_Q1": "14", "2023_Q2": "9"}]}"""
+
 print(EXTRACTION_PROMPT)
 ''')
 
@@ -694,14 +739,22 @@ md(r"""
 - **Complex:** ค่าในเซลล์ถูกต้อง แต่โครงสร้างหัวตาราง 2 ชั้นมักถูกทำให้แบน
 - **Very Complex:** ความแม่นยำลดลงชัดเจน สาเหตุหลักคือการกระจายค่าของ merge cell แนวตั้ง
 
-**ข้อจำกัดและแนวทางพัฒนาต่อ:**
+**เทคนิคที่ใช้เพิ่มความแม่นยำในโน้ตบุ๊กนี้:**
 
-1. **เพิ่ม DPI** เป็น 300 ถ้าตารางมีตัวอักษรเล็ก (แลกกับ VRAM และเวลาที่มากขึ้น)
-2. **แยกเป็น 2 ขั้น (two-pass)** — ให้โมเดลอ่านโครงสร้างหัวตารางก่อน แล้วค่อยดึงข้อมูลแถว
-   โดยส่งโครงสร้างที่ได้กลับเข้าไปใน prompt ช่วยแก้ปัญหาหัวตารางแบน
-3. **Constrained decoding** (เช่น `outlines`, `lm-format-enforcer`) บังคับให้ output
+1. **Auto-crop ขอบขาว** — ทำให้ visual token ทั้งหมดตกที่ตัวตาราง ไม่เสียไปกับกระดาษเปล่า
+   (ผลตอบแทนสูงที่สุด)
+2. **Render ที่ 300 DPI** + เพิ่ม `max_pixels` เป็น 2560 patches ใช้ VRAM ที่เหลือให้คุ้ม
+3. **Prompt ที่ระบุกฎชัดเจน + worked example** ของตารางอื่นที่ไม่เกี่ยวข้อง
+   เพื่อสอน format โดยไม่เฉลยคำตอบ
+4. **Greedy decoding** (`do_sample=False`) ให้ผลลัพธ์ทำซ้ำได้
+
+**แนวทางพัฒนาต่อ:**
+
+1. **แยกเป็น 2 ขั้น (two-pass)** — ให้โมเดลอ่านโครงสร้างหัวตารางก่อน แล้วส่งโครงสร้างนั้น
+   กลับเข้า prompt ตอนดึงข้อมูลแถว ช่วยแก้ปัญหาหัวตารางแบนโดยตรง
+2. **Constrained decoding** (เช่น `outlines`, `lm-format-enforcer`) บังคับให้ output
    ตรง JSON schema เสมอ ตัดปัญหา JSON พัง
-4. **ใช้โมเดลเฉพาะทาง** เช่น `Table Transformer` ตรวจจับโครงสร้างตารางก่อน แล้วใช้ VLM อ่านเฉพาะเนื้อหา
+3. **ใช้โมเดลเฉพาะทาง** เช่น `Table Transformer` ตรวจจับโครงสร้างตารางก่อน แล้วใช้ VLM อ่านเฉพาะเนื้อหา
 
 **EN —**
 
@@ -711,15 +764,24 @@ md(r"""
 - **Very Complex:** accuracy degrades noticeably, driven mainly by propagating
   vertically merged cells
 
-**Limitations and next steps:**
+**Accuracy techniques applied in this notebook:**
 
-1. **Raise DPI** to 300 for tables with small type, trading VRAM and latency
-2. **Two-pass extraction** — have the model describe the header structure first, then
-   feed that structure back in the prompt when extracting rows; this directly addresses
-   header flattening
-3. **Constrained decoding** (`outlines`, `lm-format-enforcer`) to guarantee the output
+1. **Auto-cropping the whitespace**, so the whole visual token budget lands on the table
+   rather than on blank paper — the highest-return change by a wide margin
+2. **300 DPI rendering** plus a raised `max_pixels` of 2560 patches, spending the VRAM
+   the 4-bit model frees up on resolution instead
+3. **An explicit rule list and a worked example** on an unrelated table, teaching the
+   output format without leaking any evaluated answer
+4. **Greedy decoding** (`do_sample=False`) for reproducible results
+
+**Further improvements:**
+
+1. **Two-pass extraction** — have the model describe the header structure first, then
+   feed that structure back into the prompt when extracting rows; this attacks header
+   flattening directly
+2. **Constrained decoding** (`outlines`, `lm-format-enforcer`) to guarantee the output
    conforms to the JSON schema, eliminating parse failures
-4. **Specialized models** such as `Table Transformer` to detect the grid structure first,
+3. **Specialized models** such as `Table Transformer` to detect the grid structure first,
    leaving the VLM to read only cell content
 """)
 
