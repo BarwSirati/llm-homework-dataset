@@ -290,17 +290,28 @@ md(r"""
 ค่าสำคัญสำหรับ T4 คือ `bnb_4bit_compute_dtype=torch.float16` (ห้ามใช้ bfloat16)
 และ `attn_implementation="sdpa"` (ห้ามใช้ flash_attention_2)
 
-นอกจากนี้เราตั้ง `max_pixels` ของ processor ไว้ค่อนข้างสูง (2560 patches) เพราะโมเดลที่ 4-bit
-เหลือ VRAM ว่างราว 8 GB ซึ่งคุ้มที่จะใช้ไปกับความละเอียดของภาพตาราง — นี่คือ trade-off
-ที่ให้ผลตอบแทนด้านความแม่นยำสูงที่สุดในงานนี้
+อีกค่าที่ต้องตั้งให้พอดีคือ `max_pixels` ซึ่งเป็นงบ visual token
+**ข้อจำกัดจริงอยู่ที่ vision encoder ไม่ใช่ตัว LLM** — Qwen2.5-VL แบ่งภาพเป็น patch 14×14
+แล้วรวม 2×2 patch เป็น 1 visual token ดังนั้น sequence ภายใน ViT จึงยาวเป็น **4 เท่า** ของงบที่ตั้ง
+และต้นทุน attention โตตาม **กำลังสอง** ของความยาวนั้น
+
+เราทดสอบแล้วพบว่าตั้ง 2560 patches ทำให้ ViT ขอ memory ก้อนเดียว ~3.9 GB และ T4 OOM จริง
+จึงใช้ 1280 patches ซึ่งคุมเทอมนี้ไว้ต่ำกว่า ~1 GB และยังให้ความละเอียดสูงกว่าเดิมมาก
+เพราะเรา crop ขอบขาวทิ้งไปแล้ว
 
 **EN —** Load Qwen2.5-VL-7B-Instruct in 4-bit NF4 with double quantization. The settings
 that matter on T4 are `bnb_4bit_compute_dtype=torch.float16` (bfloat16 is unsupported)
 and `attn_implementation="sdpa"` (FlashAttention-2 is unavailable on Turing).
 
-We set the processor's `max_pixels` generously (2560 patches): with the model at 4-bit
-there is roughly 8 GB of VRAM free, and spending it on image resolution is the single
-highest-return trade-off available for this task.
+The other number to get right is `max_pixels`, the visual token budget. **The binding
+constraint is the vision encoder, not the language model**: Qwen2.5-VL splits the image
+into 14×14 patches and merges 2×2 of them per visual token, so the ViT's internal
+sequence is **4×** the budget and its attention cost grows with the **square** of that.
+
+We measured this: a budget of 2560 patches makes the ViT request a single ~3.9 GB
+allocation and the T4 genuinely runs out of memory. 1280 keeps that term under ~1 GB
+while still giving far more resolution than before, because the whitespace is already
+cropped away.
 
 > ขั้นตอนนี้ใช้เวลาประมาณ 3–5 นาทีในการดาวน์โหลดน้ำหนักโมเดลครั้งแรก
 > This step takes roughly 3–5 minutes to download the weights on first run.
@@ -332,17 +343,25 @@ print("model loaded")
 ''')
 
 code(r'''
-# Visual token budget, in patches of 28x28 px. 2560 is deliberately generous:
-# a cropped table at 300 DPI needs the resolution, and with the model at 4-bit
-# there is ~8 GB of T4 memory free to spend on it.
+# Visual token budget, in patches of 28x28 px.
+#
+# This number is bounded by the VISION ENCODER, not by the language model. Qwen2.5-VL
+# splits the image into 14x14 patches and merges 2x2 of them into one visual token, so
+# the ViT's internal sequence is 4x this budget and its attention cost grows with the
+# SQUARE of that. At 2560 the ViT tries to allocate ~3.9 GB for one attention matrix
+# and a T4 runs out of memory; 1280 keeps that term under ~1 GB.
+MAX_PATCHES = 1280
+
 processor = AutoProcessor.from_pretrained(
     MODEL_ID,
-    min_pixels=512 * 28 * 28,
-    max_pixels=2560 * 28 * 28,
+    min_pixels=256 * 28 * 28,
+    max_pixels=MAX_PATCHES * 28 * 28,
 )
 
 vram = torch.cuda.memory_allocated() / 1024**3
 print(f"processor ready | VRAM allocated after load: {vram:.2f} GB")
+print(f"visual token budget: {MAX_PATCHES} patches "
+      f"(ViT sequence ~{MAX_PATCHES * 4} tokens)")
 ''')
 
 # --------------------------------------------------------------------------
@@ -400,11 +419,16 @@ print(EXTRACTION_PROMPT)
 ''')
 
 code(r'''
-import json, re
+import json, re, gc
 from qwen_vl_utils import process_vision_info
 
 def extract_table_json(image, max_new_tokens=1536):
     """Run the VLM on one table image and parse its JSON output."""
+    # Release the previous case's activations; on a 15 GB T4 the three runs would
+    # otherwise accumulate and the largest table would fail with an OOM.
+    gc.collect()
+    torch.cuda.empty_cache()
+
     messages = [{"role": "user", "content": [
         {"type": "image", "image": image},
         {"type": "text",  "text": EXTRACTION_PROMPT},
@@ -507,7 +531,7 @@ md(r"""
 
 code(r'''
 t0 = time.time()
-raw_vc, json_vc = extract_table_json(images["very_complex"], max_new_tokens=2048)
+raw_vc, json_vc = extract_table_json(images["very_complex"], max_new_tokens=1536)
 print(f"generated in {time.time() - t0:.1f}s\n")
 print(json.dumps(json_vc, indent=2, ensure_ascii=False))
 ''')
@@ -752,7 +776,8 @@ md(r"""
 
 1. **Auto-crop ขอบขาว** — ทำให้ visual token ทั้งหมดตกที่ตัวตาราง ไม่เสียไปกับกระดาษเปล่า
    (ผลตอบแทนสูงที่สุด)
-2. **Render ที่ 300 DPI** + เพิ่ม `max_pixels` เป็น 2560 patches ใช้ VRAM ที่เหลือให้คุ้ม
+2. **Render ที่ 300 DPI** + ตั้ง `max_pixels` ที่ 1280 patches ซึ่งเป็นจุดสูงสุดที่ T4 รับไหว
+   (สูงกว่านี้ vision encoder จะ OOM)
 3. **Prompt ที่ระบุกฎชัดเจน + worked example** ของตารางอื่นที่ไม่เกี่ยวข้อง
    เพื่อสอน format โดยไม่เฉลยคำตอบ
 4. **Greedy decoding** (`do_sample=False`) ให้ผลลัพธ์ทำซ้ำได้
@@ -777,8 +802,8 @@ md(r"""
 
 1. **Auto-cropping the whitespace**, so the whole visual token budget lands on the table
    rather than on blank paper — the highest-return change by a wide margin
-2. **300 DPI rendering** plus a raised `max_pixels` of 2560 patches, spending the VRAM
-   the 4-bit model frees up on resolution instead
+2. **300 DPI rendering** with `max_pixels` at 1280 patches — empirically the ceiling a
+   T4 sustains, since the vision encoder OOMs above it
 3. **An explicit rule list and a worked example** on an unrelated table, teaching the
    output format without leaking any evaluated answer
 4. **Greedy decoding** (`do_sample=False`) for reproducible results
