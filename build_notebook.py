@@ -521,14 +521,23 @@ md(r"""
 
 1. **Header accuracy** — ชื่อคอลัมน์ที่ดึงได้ตรงกับที่ควรเป็นกี่ % (ใช้ set comparison)
 2. **Row count** — จำนวนแถวถูกต้องหรือไม่
-3. **Cell accuracy** — เทียบค่าในเซลล์ทีละตัว (เฉพาะคอลัมน์ที่ชื่อตรงกัน)
+3. **Cell accuracy** — เทียบค่าในเซลล์ทีละตัว **โดยเทียบตามตำแหน่งคอลัมน์** ไม่ใช่ตามชื่อ
+
+> จุดสำคัญ: ถ้าเทียบเซลล์ด้วย *ชื่อ* คอลัมน์ เมื่อโมเดลทำหัวตารางแบน cell accuracy
+> จะกลายเป็น 0 ไปด้วย ทำให้แยกไม่ออกว่าโมเดล "อ่านค่าผิด" หรือแค่ "ตั้งชื่อคอลัมน์ต่างไป"
+> การเทียบตามตำแหน่งทำให้ 2 ตัวชี้วัดนี้เป็นอิสระต่อกัน
 
 **EN —** We compare the output against a **ground truth** written in advance from the
 actual table content, measuring three dimensions:
 
 1. **Header accuracy** — what fraction of expected column names were recovered
 2. **Row count** — was the number of rows correct
-3. **Cell accuracy** — value-by-value comparison on columns whose names matched
+3. **Cell accuracy** — value-by-value comparison **matched by column position**, not by name
+
+> Why position: if cells were matched by column *name*, a flattened header would drag
+> cell accuracy to zero too, and we could not distinguish "the model misread the values"
+> from "the model named the columns differently". Matching positionally keeps the two
+> metrics independent.
 """)
 
 code(r'''
