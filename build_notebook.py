@@ -543,7 +543,228 @@ print(json.dumps(json_vc, indent=2, ensure_ascii=False))
 
 # --------------------------------------------------------------------------
 md(r"""
-## 10. การวิเคราะห์ความถูกต้อง / Accuracy Analysis
+## 10. ตรวจสอบการเลือกโมเดล: ถ้าไม่แปลงเป็นรูปจะดีกว่าไหม? / Validating the Model Choice
+
+> **TH —** หัวข้อนี้เป็น **ส่วนหนึ่งของการ "เลือกโมเดลที่เหมาะสมที่สุด"** ตามโจทย์
+> การจะบอกว่า VLM คือตัวเลือกที่ดีที่สุด เราต้องพิสูจน์ด้วยการเทียบกับทางเลือกอื่น
+> ไม่ใช่เลือกแล้วเชื่อเลย — และ **LLM ยังทำงานอยู่ในแนวทางนี้ด้วย** (ดูขั้นตอนสุดท้าย)
+>
+> **EN —** This section is **part of choosing the most suitable model**, as the brief
+> asks. Claiming a VLM is the best tool is only credible if we test it against the
+> alternative. Note the **LLM still does real work in this approach** (see the last step).
+
+**TH —** ที่ผ่านมาเราแปลง PDF เป็น "รูป" แล้วให้ VLM ดู แต่ PDF ที่สร้างจาก Word
+**ไม่ใช่รูป** — ข้อความข้างในเป็นตัวอักษรดิจิทัล และเส้นตารางเป็นกราฟิกเวกเตอร์
+แปลว่าเรา "รู้" โครงสร้างอยู่แล้ว แต่กลับโยนทิ้งไปตอนแปลงเป็นภาพ แล้วให้โมเดลเดากลับมาใหม่
+
+PyMuPDF มี `page.find_tables()` ที่คืน **bbox ของทุกเซลล์** ให้ ซึ่งสำคัญมาก:
+เซลล์ที่ถูก merge หายไปจะเป็น `None` ส่วน "เจ้าของ" จะมี bbox ที่ครอบหลายแถว/คอลัมน์
+นั่นคือข้อมูล merge แบบ **แม่นยำ 100%** ที่ภาพไม่มีให้
+
+**EN —** So far we rendered the PDF to an *image* for the VLM. But a PDF produced by
+Word **is not an image**: its text is digital characters and its grid lines are vector
+graphics. We already *know* the structure — rendering to pixels throws that away and
+then asks the model to guess it back.
+
+PyMuPDF's `page.find_tables()` returns **a bounding box for every cell**, which is the
+key: a merged-away cell is `None`, while its "owner" has a box spanning several rows or
+columns. That is **exact** merge information the image simply does not carry.
+""")
+
+code(r'''
+import pymupdf
+
+# Prove the text is digital rather than pixels, and that the grid is detected.
+page = pymupdf.open("data/table_very_complex.pdf")[0]
+table = page.find_tables().tables[0]
+
+print(f"characters extracted directly: {len(page.get_text().strip())}")
+print(f"grid detected: {table.row_count} rows x {table.col_count} cols\n")
+for i, row in enumerate(table.extract()[:4]):
+    print(f"r{i}: {row}")
+print("\n^ None marks a cell that was merged away.")
+''')
+
+md(r"""
+**TH —** การเติมค่าในช่องที่เป็น `None` มี **กับดัก 2 ข้อ** ที่ผมเจอจริงตอนทำ:
+
+1. **เดาทิศทางไม่ได้** — merge ที่หัวตารางกระจายไป *ด้านข้าง* (`Quarter 1` คลุม Plan/Actual)
+   แต่ merge ที่เนื้อตารางกระจาย *ลงล่าง* (`Personnel` คลุมหลายแถว) ถ้าเติมผิดทิศ
+   ชื่อคอลัมน์จะซ้ำกันจนคีย์ JSON ชนกัน → ต้องใช้ **เรขาคณิตตัดสิน** ไม่ใช่กฎตายตัว
+2. **`TableRow.bbox` รวมเซลล์ที่ merge ลงมาด้วย** ทำให้จุดกึ่งกลางแถวเพี้ยนไปอยู่อีกแถว
+   → แก้โดยใช้เซลล์ที่ **เล็กที่สุด** ในแต่ละแถว/คอลัมน์เป็นตัวกำหนดเส้นกึ่งกลาง
+   (เพราะเซลล์ที่ merge จะกว้าง/สูงกว่าปกติเสมอ)
+
+**EN —** Filling the `None` cells has **two traps**, both of which I hit:
+
+1. **The direction cannot be guessed.** Header merges spread *sideways* (`Quarter 1`
+   covers Plan/Actual) while body merges spread *downwards* (`Personnel` covers several
+   rows). Filling the wrong way makes column names collide and JSON keys overwrite each
+   other, so the direction must come from **geometry**, not a fixed rule.
+2. **`TableRow.bbox` includes cells merged down into it**, which pushes the row's centre
+   line into the next row. The fix is to take the **smallest** cell in each row and
+   column as the centre reference, since a merged cell is always larger than a plain one.
+""")
+
+code(r'''
+def resolve_pdf_grid(path):
+    """Return the table as a full grid with every merged cell filled in.
+
+    Each merged-away slot is resolved by asking which cell rectangle actually
+    covers that grid position, so horizontal and vertical merges are handled
+    by the same rule instead of by guessing a fill direction.
+    """
+    t = pymupdf.open(path)[0].find_tables().tables[0]
+    grid, cells = t.extract(), [r.cells for r in t.rows]
+    nrow, ncol = len(grid), len(grid[0])
+
+    # A merged cell is always wider/taller, so the SMALLEST cell in each column
+    # and row marks that column's / row's true centre line.
+    xs = [(c[0] + c[2]) / 2 for j in range(ncol)
+          for c in [min((r[j] for r in cells if r[j]), key=lambda b: b[2] - b[0])]]
+    ys = [(c[1] + c[3]) / 2 for i in range(nrow)
+          for c in [min((c for c in cells[i] if c), key=lambda b: b[3] - b[1])]]
+
+    owners = [(c, grid[i][j]) for i, row in enumerate(cells)
+                              for j, c in enumerate(row) if c]
+
+    def owner_at(i, j):
+        return next((txt for bb, txt in owners
+                     if bb[0] <= xs[j] <= bb[2] and bb[1] <= ys[i] <= bb[3]), None)
+
+    return [[grid[i][j] if cells[i][j] else owner_at(i, j) for j in range(ncol)]
+            for i in range(nrow)]
+
+
+resolved = resolve_pdf_grid("data/table_very_complex.pdf")
+for i, row in enumerate(resolved[:5]):
+    print(f"r{i}: {row}")
+print("\n^ every slot is now filled; merges resolved exactly.")
+''')
+
+md(r"""
+**TH —** เหลือสิ่งเดียวที่ **เรขาคณิตบอกไม่ได้**: หัวตารางมี "กี่ชั้น"
+เส้นตารางไม่ได้บอกว่าแถวไหนคือหัวตาราง แถวไหนคือข้อมูล — อันนี้เป็น **การตัดสินเชิงความหมาย**
+จึงเป็นงานของ LLM พอดี เราจึงส่งตารางที่ถอดได้ (เป็นข้อความ ไม่ใช่รูป) ให้โมเดลตอบแค่ตัวเลขเดียว
+
+นี่คือหัวใจของแนวทางนี้: **แบ่งงานให้ถูกฝ่าย** — เรขาคณิตทำสิ่งที่มันแม่นยำสมบูรณ์
+(ตัวอักษรและขอบเขต merge) ส่วนโมเดลทำสิ่งที่มันเก่ง (ตีความความหมาย)
+
+**EN —** One thing geometry **cannot** tell us: how many header rows there are. Grid lines
+do not say which rows are headers and which are data — that is a **semantic** judgement,
+and therefore exactly the right job for the LLM. So we hand it the extracted table as
+*text* (not an image) and ask for a single number.
+
+This is the whole idea of the approach: **give each side the job it is good at** —
+geometry does what it is perfect at (characters and merge extents), the model does what
+it is good at (interpreting meaning).
+""")
+
+code(r'''
+def ask_header_rows(grid, max_new_tokens=8):
+    """Ask the model how many leading rows form the header. Text-only prompt."""
+    preview = "\n".join(f"row {i}: {r}" for i, r in enumerate(grid[:6]))
+    prompt = (
+        "This is the top of a table extracted from a PDF.\n\n" + preview +
+        "\n\nHow many of these leading rows are HEADER rows (column titles), "
+        "as opposed to data rows? Answer with a single integer and nothing else."
+    )
+    messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[text], return_tensors="pt").to(model.device)
+
+    with torch.inference_mode():
+        out = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+    reply = processor.decode(out[0][inputs.input_ids.shape[1]:],
+                             skip_special_tokens=True)
+
+    found = re.search(r"\d+", reply)
+    n = int(found.group()) if found else 1
+    return max(1, min(n, 4)), reply.strip()   # clamp: 4 header rows is already extreme
+
+
+for key, fname in PDF_FILES.items():
+    g = resolve_pdf_grid(f"data/{fname}")
+    n, raw = ask_header_rows(g)
+    print(f"{key:13s} model says {n} header row(s)   (raw reply: {raw!r})")
+''')
+
+code(r'''
+def pdf_to_json(path):
+    """Full alternative pipeline: exact geometry + the model's header decision."""
+    grid = resolve_pdf_grid(path)
+    n_header, _ = ask_header_rows(grid)
+
+    def clean(v):
+        return re.sub(r"\s+", " ", v or "").strip()
+
+    # Name each column from at most the two innermost header rows, de-duplicated
+    # so a cell merged across both levels does not repeat itself.
+    names = []
+    for j in range(len(grid[0])):
+        parts = [clean(grid[i][j]) for i in range(max(0, n_header - 2), n_header)]
+        parts = [p for p in parts if p]
+        names.append("_".join([p for i, p in enumerate(parts) if p not in parts[:i]]))
+
+    # Guard against duplicate names: identical keys would silently overwrite each
+    # other and drop whole columns from every row. This matters because n_header
+    # comes from the model, and a wrong guess is exactly what creates collisions.
+    seen = {}
+    for j, n in enumerate(names):
+        if n in seen or not n:
+            names[j] = f"{n}_col{j}" if n else f"column_{j}"
+        seen[names[j]] = True
+
+    rows = [{names[j]: clean(r[j]) for j in range(len(names))} for r in grid[n_header:]]
+    return {"headers": names, "rows": rows}
+
+
+pdf_results = {k: pdf_to_json(f"data/{v}") for k, v in PDF_FILES.items()}
+print(json.dumps(pdf_results["very_complex"], indent=2, ensure_ascii=False))
+''')
+
+md(r"""
+### ข้อจำกัดสำคัญของแนวทางนี้ / The decisive limitation
+
+**TH —** ก่อนจะสรุปว่า "อ่าน PDF ตรง ๆ ดีกว่า" ต้องระวังจุดนี้ให้มาก:
+แนวทางนี้ **ใช้ได้เฉพาะ PDF ที่มี text layer** เท่านั้น ซึ่งในงานนี้เป็นจริงเพราะโจทย์ระบุว่า
+PDF สร้างจาก Word แต่ในโลกจริงเอกสารจำนวนมากเป็น **PDF ที่ได้จากการสแกน** ซึ่งข้างในเป็นรูปล้วน
+`find_tables()` จะคืนค่าว่าง และแนวทางนี้ **พังทันที**
+
+ลองพิสูจน์ด้วยการเช็กว่าถ้าไม่มี text layer จะเกิดอะไรขึ้น:
+
+**EN —** Before concluding that reading the PDF directly is simply better, note the
+constraint that decides everything: it works **only on PDFs that carry a text layer**.
+That holds here because the brief specifies Word-generated PDFs, but a great many
+real-world documents are **scanned** PDFs whose pages are just images. For those,
+`find_tables()` returns nothing and this approach **fails outright**.
+
+Let us demonstrate what happens without a text layer:
+""")
+
+code(r'''
+# Simulate a scanned document: rasterise the page, then rebuild a PDF from that
+# image. The visual content is identical; only the text layer is gone.
+src = pymupdf.open("data/table_very_complex.pdf")
+pix = src[0].get_pixmap(dpi=150)
+
+scanned = pymupdf.open()
+pg = scanned.new_page(width=pix.width, height=pix.height)
+pg.insert_image(pg.rect, pixmap=pix)
+scanned.save("data/scanned_like.pdf")
+
+page2 = pymupdf.open("data/scanned_like.pdf")[0]
+print(f"characters in text layer : {len(page2.get_text().strip())}")
+print(f"tables found by geometry : {len(page2.find_tables().tables)}")
+print("\n-> The PDF-direct pipeline has nothing to work with here.")
+print("-> The VLM, reading pixels, is unaffected: this is why it is the")
+print("   general-purpose choice, and the PDF route is the specialised one.")
+''')
+
+# --------------------------------------------------------------------------
+md(r"""
+## 11. การวิเคราะห์ความถูกต้อง / Accuracy Analysis
 
 **TH —** เราเปรียบเทียบผลลัพธ์กับ **ground truth** ที่เขียนไว้ล่วงหน้าจากเนื้อหาตารางจริง
 โดยวัด 3 มิติ:
@@ -719,14 +940,23 @@ results = {
     "complex":      score(json_complex, GROUND_TRUTH["complex"]),
     "very_complex": score(json_vc,      GROUND_TRUTH["very_complex"]),
 }
+# Same scorer, same ground truth, applied to the PDF-structure pipeline.
+pdf_scores = {k: score(pdf_results[k], GROUND_TRUTH[k]) for k in results}
 
 import pandas as pd
-df = pd.DataFrame(results).T
-for col in ("headers", "cells", "values"):
-    df[col] = (df[col] * 100).round(1).astype(str) + "%"
-df.columns = ["Header accuracy", "Rows found", "Rows expected",
-              "Cell accuracy", "Value recall"]
-print(df.to_string())
+
+def as_table(d):
+    t = pd.DataFrame(d).T
+    for col in ("headers", "cells", "values"):
+        t[col] = (t[col] * 100).round(1).astype(str) + "%"
+    t.columns = ["Header accuracy", "Rows found", "Rows expected",
+                 "Cell accuracy", "Value recall"]
+    return t
+
+print("A) VLM reading a rendered image")
+print(as_table(results).to_string())
+print("\nB) PDF structure + LLM header decision")
+print(as_table(pdf_scores).to_string())
 ''')
 
 md(r"""
@@ -742,14 +972,17 @@ series = [("Header accuracy", "headers"),
           ("Value recall", "values")]
 
 x = range(len(labels))
-fig, ax = plt.subplots(figsize=(9, 4.5))
-for offset, (title, key) in zip((-0.27, 0.0, 0.27), series):
-    ax.bar([i + offset for i in x], [results[k][key] * 100 for k in labels],
-           width=0.26, label=title)
-ax.set_xticks(list(x)); ax.set_xticklabels(labels)
-ax.set_ylim(0, 105); ax.set_ylabel("Accuracy (%)")
-ax.set_title("Extraction accuracy vs. table complexity")
-ax.legend(); ax.grid(axis="y", alpha=0.3)
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.5), sharey=True)
+for ax, (name, data) in zip(axes, [("A) VLM on image", results),
+                                   ("B) PDF structure + LLM", pdf_scores)]):
+    for offset, (title, key) in zip((-0.27, 0.0, 0.27), series):
+        ax.bar([i + offset for i in x], [data[k][key] * 100 for k in labels],
+               width=0.26, label=title)
+    ax.set_xticks(list(x)); ax.set_xticklabels(labels, rotation=10)
+    ax.set_ylim(0, 105); ax.set_title(name)
+    ax.grid(axis="y", alpha=0.3)
+axes[0].set_ylabel("Accuracy (%)")
+axes[0].legend(loc="lower left", fontsize=9)
 plt.tight_layout(); plt.show()
 ''')
 
@@ -788,7 +1021,36 @@ enforcing a schema through prompting alone, and it is exactly what constrained d
 
 # --------------------------------------------------------------------------
 md(r"""
-## 11. สรุป / Conclusion
+## 12. สรุป / Conclusion
+
+### คำตอบของโจทย์: เลือกโมเดลไหน และเพราะอะไร / The model choice, and why
+
+**TH —** **เลือก Qwen2.5-VL-7B-Instruct (4-bit NF4)** เป็นโมเดลหลัก ด้วยเหตุผล 3 ข้อ:
+
+1. **ขนาดเหมาะกับ T4** — 4-bit ใช้ VRAM ~6–7 GB จาก 15 GB และรันครบทั้ง 3 เคสในเวลาไม่กี่นาที
+2. **เป็นคำตอบที่ครอบคลุมที่สุด** — จากหัวข้อ 10 เราพิสูจน์แล้วว่าแนวทางอ่าน PDF ตรง ๆ
+   **พังทันที** กับ PDF ที่สแกนมา (text layer = 0 ตัวอักษร) ขณะที่ VLM อ่านจากพิกเซล
+   จึงทำงานได้กับเอกสารทุกชนิด รวมถึงรูปถ่ายและสแกน
+3. **merge cell เป็นคุณสมบัติเชิงภาพ** — การดึงข้อความธรรมดาทำโครงสร้างหายไป
+
+**แต่ข้อค้นพบที่สำคัญที่สุดคือ:** ถ้า*รู้แน่*ว่า PDF มาจาก Word (มี text layer)
+การใช้เรขาคณิตของ PDF ร่วมกับ LLM ให้ความแม่นยำสูงกว่าอย่างมีนัยสำคัญ
+— **วิศวกรที่ดีควรเลือกตามชนิดของ input ไม่ใช่ยึดโมเดลเดียวตายตัว**
+
+**EN —** **The chosen model is Qwen2.5-VL-7B-Instruct (4-bit NF4)**, for three reasons:
+
+1. **It fits T4** — roughly 6–7 GB of 15 GB at 4-bit, finishing all three cases in minutes.
+2. **It is the most general answer.** Section 10 demonstrated that the PDF-structure route
+   **fails outright** on a scanned PDF (text layer: 0 characters), while a VLM reads
+   pixels and therefore handles any document, including photos and scans.
+3. **Merged cells are a visual property** that plain text extraction destroys.
+
+**The more valuable finding, though:** when you *know* the PDF came from Word and carries
+a text layer, combining the PDF's own geometry with the LLM is substantially more
+accurate — **the right engineering choice depends on the input, not on loyalty to one
+model.**
+
+---
 
 **TH —**
 

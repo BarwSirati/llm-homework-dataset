@@ -1,13 +1,9 @@
-"""Expected JSON for each of the three tables.
+"""Expected JSON for each table — mirrors the copy embedded in the notebook.
 
-Authored next to make_docx.py so the table content and the expected extraction
-stay in sync. The notebook imports these to score the model's output.
-
-Convention: body cells that are merged in the source document are expanded to
-repeated values, so every row is a flat, complete record. This is the same
-convention the extraction prompt asks the model to follow.
+Kept in sync so the standalone scripts and the notebook cannot drift apart.
 """
 
+# the exact content of the three source tables.
 GROUND_TRUTH = {
     "simple": {
         "headers": ["Student ID", "Full Name", "Department", "Grade"],
@@ -24,40 +20,38 @@ GROUND_TRUTH = {
              "Department": "Electrical Engineering", "Grade": "C+"},
         ],
     },
+    # Header names follow prompt rule 2: parent_child for grouped columns.
     "complex": {
-        # Two-level header: parent -> children. Leaf names become row keys.
-        "headers": {
-            "Student Information": ["Student ID", "Full Name"],
-            "Assessment": ["Midterm (30)", "Final (40)", "Group Work (20)"],
-            "Total Score (100)": [],
-        },
+        "headers": ["Student Information_Student ID",
+                    "Student Information_Full Name",
+                    "Assessment_Midterm (30)", "Assessment_Final (40)",
+                    "Assessment_Group Work (20)", "Total Score (100)"],
         "rows": [
-            {"Student ID": "65010001", "Full Name": "John Carter",
-             "Midterm (30)": "28", "Final (40)": "35",
-             "Group Work (20)": "18", "Total Score (100)": "81"},
-            {"Student ID": "65010002", "Full Name": "Emily Watson",
-             "Midterm (30)": "25", "Final (40)": "30",
-             "Group Work (20)": "20", "Total Score (100)": "75"},
-            {"Student ID": "65010003", "Full Name": "Michael Chen",
-             "Midterm (30)": "30", "Final (40)": "38",
-             "Group Work (20)": "19", "Total Score (100)": "87"},
-            {"Student ID": "65010004", "Full Name": "Sarah Johnson",
-             "Midterm (30)": "22", "Final (40)": "28",
-             "Group Work (20)": "15", "Total Score (100)": "65"},
-            {"Student ID": "65010005", "Full Name": "David Miller",
-             "Midterm (30)": "19", "Final (40)": "24",
-             "Group Work (20)": "14", "Total Score (100)": "57"},
+            {"Student Information_Student ID": "65010001",
+             "Student Information_Full Name": "John Carter",
+             "Assessment_Midterm (30)": "28", "Assessment_Final (40)": "35",
+             "Assessment_Group Work (20)": "18", "Total Score (100)": "81"},
+            {"Student Information_Student ID": "65010002",
+             "Student Information_Full Name": "Emily Watson",
+             "Assessment_Midterm (30)": "25", "Assessment_Final (40)": "30",
+             "Assessment_Group Work (20)": "20", "Total Score (100)": "75"},
+            {"Student Information_Student ID": "65010003",
+             "Student Information_Full Name": "Michael Chen",
+             "Assessment_Midterm (30)": "30", "Assessment_Final (40)": "38",
+             "Assessment_Group Work (20)": "19", "Total Score (100)": "87"},
+            {"Student Information_Student ID": "65010004",
+             "Student Information_Full Name": "Sarah Johnson",
+             "Assessment_Midterm (30)": "22", "Assessment_Final (40)": "28",
+             "Assessment_Group Work (20)": "15", "Total Score (100)": "65"},
+            {"Student Information_Student ID": "65010005",
+             "Student Information_Full Name": "David Miller",
+             "Assessment_Midterm (30)": "19", "Assessment_Final (40)": "24",
+             "Assessment_Group Work (20)": "14", "Total Score (100)": "57"},
         ],
     },
     "very_complex": {
-        # Three-level header; each quarter splits into Plan / Actual.
-        "headers": {
-            "Category": [],
-            "Item": [],
-            "Quarter 1": ["Plan", "Actual"],
-            "Quarter 2": ["Plan", "Actual"],
-        },
-        # Vertically merged category labels are repeated on every row they span.
+        "headers": ["Category", "Item", "Quarter 1_Plan", "Quarter 1_Actual",
+                    "Quarter 2_Plan", "Quarter 2_Actual"],
         "rows": [
             {"Category": "Personnel", "Item": "Salaries",
              "Quarter 1_Plan": "1,200", "Quarter 1_Actual": "1,180",
@@ -95,10 +89,5 @@ GROUND_TRUTH = {
 
 
 if __name__ == "__main__":
-    import json
-
-    for name, table in GROUND_TRUTH.items():
-        print(f"{name}: {len(table['rows'])} rows, "
-              f"{len(table['rows'][0])} fields per row")
-    print("\nSample row (very_complex):")
-    print(json.dumps(GROUND_TRUTH["very_complex"]["rows"][0], indent=2))
+    for name, gt in GROUND_TRUTH.items():
+        print(f"{name:13s} {len(gt['headers'])} columns x {len(gt['rows'])} rows")

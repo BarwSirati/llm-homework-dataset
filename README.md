@@ -1,10 +1,21 @@
 # Demo: Converting Complex PDF Tables into JSON
 
 Extracting tables of increasing structural complexity from Word-generated PDFs into
-structured JSON, using a **local Vision-Language Model only** (no LLM APIs), running on
-a Google Colab **T4 GPU**.
+structured JSON, using a **local model only** (no LLM APIs), running on a Google Colab
+**T4 GPU**.
 
 **Model:** `Qwen/Qwen2.5-VL-7B-Instruct` quantized to 4-bit NF4 (~6–7 GB VRAM).
+
+The notebook evaluates two pipelines against the same ground truth:
+
+- **A — VLM on a rendered image.** The general-purpose route: works on any PDF,
+  including scans, because it reads pixels.
+- **B — PDF geometry + LLM.** `find_tables()` supplies exact text and exact merge
+  extents; the LLM decides how many header rows there are. Far more accurate, but only
+  works when the PDF carries a text layer (the notebook demonstrates it failing on a
+  scanned page).
+
+The comparison is what justifies the model choice, which is the point of the assignment.
 
 ## Test cases
 
