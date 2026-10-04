@@ -650,6 +650,32 @@ md(r"""
 นี่คือหัวใจของแนวทางนี้: **แบ่งงานให้ถูกฝ่าย** — เรขาคณิตทำสิ่งที่มันแม่นยำสมบูรณ์
 (ตัวอักษรและขอบเขต merge) ส่วนโมเดลทำสิ่งที่มันเก่ง (ตีความความหมาย)
 
+> **สิ่งที่เจอจากการรันจริง:** โมเดลตอบจำนวนชั้นหัวตารางของตาราง Simple **ผิด** (ตอบ 2 แทน 1)
+> ทำให้แถวข้อมูลแรกถูกกินไปเป็นหัวตาราง เหลือ 4 แถวจาก 5 และคะแนนตกเป็น 0% ทั้งหมด
+> เราจึงเพิ่ม **ด่านตรวจเชิงกำหนด**: หัวตารางเป็น "ป้ายชื่อ" จึงไม่มีทางเป็นตัวเลขล้วน
+> ถ้าคำตอบของโมเดลจะดึงแถวตัวเลขขึ้นมาเป็นหัวตาราง ให้ถอยค่าลง
+> และกฎคู่กัน: ถ้าชื่อคอลัมน์ออกมา **ซ้ำกัน** แปลว่าหัวตารางตื้นเกินไป ต้องลึกขึ้นอีกชั้น
+> — **โมเดลเสนอ กฎเกณฑ์ตรวจสอบ** คือรูปแบบที่ใช้ได้ผลจริงในงาน production
+>
+> **ข้อควรรายงานอย่างตรงไปตรงมา:** กฎ 2 ข้อนี้แข็งแรงพอที่จะแก้คำตอบผิดได้**ทุกกรณี**
+> ในตาราง 3 ใบนี้ (ทดสอบโดยบังคับให้โมเดลตอบ 1/2/3/4 แล้วยังได้ 100% ทุกครั้ง)
+> แปลว่าสำหรับโจทย์แคบ ๆ แบบนี้ **โครงสร้างจาก PDF + กฎตรวจสอบ มีน้ำหนักมากกว่าการตัดสินของโมเดล**
+> บทบาทของ LLM จะสำคัญขึ้นกับตารางที่กฎเหล่านี้ตัดสินไม่ได้
+
+> **What the real run exposed:** the model answered the Simple table's header depth
+> **wrong** (2 instead of 1), swallowing the first data row — 4 rows instead of 5, and
+> every score collapsed to 0%. So we added a **deterministic veto**: a header cell is a
+> label and therefore never a bare number, so if the model's answer would pull a row of
+> numbers into the header, we walk it back. A companion rule handles the opposite error:
+> if two columns end up with the **same name**, the header is too shallow, so go deeper.
+> **The model proposes, a rule disposes** — a pattern that holds up well in production.
+>
+> **Reported honestly:** those two rules turn out to be strong enough to repair *any*
+> wrong answer on these three tables — forcing the model to reply 1, 2, 3 or 4 still
+> yields 100% every time. For a task this narrow, **the PDF's own structure plus a
+> validation rule carries more weight than the model's judgement.** The LLM's
+> contribution would matter more on tables where these rules cannot decide.
+
 **EN —** One thing geometry **cannot** tell us: how many header rows there are. Grid lines
 do not say which rows are headers and which are data — that is a **semantic** judgement,
 and therefore exactly the right job for the LLM. So we hand it the extracted table as
@@ -684,30 +710,57 @@ def ask_header_rows(grid, max_new_tokens=8):
     return max(1, min(n, 4)), reply.strip()   # clamp: 4 header rows is already extreme
 
 
+def clean(v):
+    return re.sub(r"\s+", " ", v or "").strip()
+
+
+def looks_like_data(value):
+    """True for a bare number such as '80' or '1,430' -- never a column title."""
+    return bool(re.fullmatch(r"[\d,.\s]+", clean(value) or "x"))
+
+
+def column_names(grid, n_header):
+    """Name each column from at most the two innermost header rows it belongs to."""
+    names = []
+    for j in range(len(grid[0])):
+        parts = [clean(grid[i][j]) for i in range(max(0, n_header - 2), n_header)]
+        parts = [p for p in parts if p]
+        names.append("_".join([p for i, p in enumerate(parts) if p not in parts[:i]]))
+    return names
+
+
+def header_rows(grid, max_depth=4):
+    """The model proposes a header depth; two deterministic rules correct it.
+
+    Rule 1 (too deep): a header cell is a label, never a bare number. If the
+    model's count would pull a row of numbers into the header, walk it back.
+    Rule 2 (too shallow): if two columns end up with the SAME name, the header
+    is not deep enough to tell them apart, so go one level deeper.
+    """
+    n, raw = ask_header_rows(grid)
+
+    while n > 1 and any(looks_like_data(c) for c in grid[n - 1]):
+        n -= 1
+    while n < max_depth and len(set(column_names(grid, n))) < len(grid[0]) \
+            and not any(looks_like_data(c) for c in grid[n]):
+        n += 1
+    return n, raw
+
+
 for key, fname in PDF_FILES.items():
     g = resolve_pdf_grid(f"data/{fname}")
-    n, raw = ask_header_rows(g)
-    print(f"{key:13s} model says {n} header row(s)   (raw reply: {raw!r})")
+    n, raw = header_rows(g)
+    print(f"{key:13s} -> {n} header row(s)   (model replied {raw!r})")
 ''')
 
 code(r'''
 def pdf_to_json(path):
     """Full alternative pipeline: exact geometry + the model's header decision."""
     grid = resolve_pdf_grid(path)
-    n_header, _ = ask_header_rows(grid)
+    n_header, _ = header_rows(grid)
+    names = column_names(grid, n_header)
 
-    def clean(v):
-        return re.sub(r"\s+", " ", v or "").strip()
-
-    # Name each column from at most the two innermost header rows, de-duplicated
-    # so a cell merged across both levels does not repeat itself.
-    names = []
-    for j in range(len(grid[0])):
-        parts = [clean(grid[i][j]) for i in range(max(0, n_header - 2), n_header)]
-        parts = [p for p in parts if p]
-        names.append("_".join([p for i, p in enumerate(parts) if p not in parts[:i]]))
-
-    # Guard against duplicate names: identical keys would silently overwrite each
+    # Last-resort guard against duplicate names: identical keys would overwrite each
     # other and drop whole columns from every row. This matters because n_header
     # comes from the model, and a wrong guess is exactly what creates collisions.
     seen = {}
